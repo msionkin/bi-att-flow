@@ -1,4 +1,4 @@
-tensorflow>=0.11
-nltk
+tensorflow==0.12.1
+nltk==3.2.1
 tqdm
 jinja2

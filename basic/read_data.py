@@ -157,7 +157,7 @@ def load_metadata(config, data_type):
 
 def read_data(config, data_type, ref, data_filter=None):
     data_path = os.path.join(config.data_dir, "data_{}.json".format(data_type))
-    shared_path = os.path.join(config.data_dir, "shared_{}.json".format(data_type))
+    shared_path = os.path.join(config.data_dir, "new_hatched_shared_{}.json".format(data_type))
     with open(data_path, 'r') as fh:
         data = json.load(fh)
     with open(shared_path, 'r') as fh:
@@ -177,7 +177,7 @@ def read_data(config, data_type, ref, data_filter=None):
 
     print("Loaded {}/{} examples from {}".format(len(valid_idxs), num_examples, data_type))
 
-    shared_path = config.shared_path or os.path.join(config.out_dir, "shared.json")
+    #shared_path = config.shared_path or os.path.join(config.out_dir, "shared.json")
     if not ref:
         word2vec_dict = shared['lower_word2vec'] if config.lower_word else shared['word2vec']
         word_counter = shared['lower_word_counter'] if config.lower_word else shared['word_counter']
@@ -298,7 +298,7 @@ def update_config(config, data_sets):
                 config.max_ques_size = max(config.max_ques_size, len(q))
                 config.max_word_size = max(config.max_word_size, max(len(word) for word in q))
 
-    if config.mode == 'train':
+    if config.mode == 'train' or config.mode == 'retrain':
         config.max_num_sents = min(config.max_num_sents, config.num_sents_th)
         config.max_sent_size = min(config.max_sent_size, config.sent_size_th)
         config.max_para_size = min(config.max_para_size, config.para_size_th)

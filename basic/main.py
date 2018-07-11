@@ -1,19 +1,19 @@
 import argparse
 import json
 import math
-import os
-import shutil
 from pprint import pprint
 
+import numpy as np
+import os
+import shutil
 import tensorflow as tf
 from tqdm import tqdm
-import numpy as np
 
 from basic.evaluator import ForwardEvaluator, MultiGPUF1Evaluator
 from basic.graph_handler import GraphHandler
 from basic.model import get_multi_gpu_models
-from basic.trainer import MultiGPUTrainer
 from basic.read_data import read_data, get_squad_data_filter, update_config
+from basic.trainer import MultiGPUTrainer
 
 
 def main(config):
@@ -25,13 +25,15 @@ def main(config):
             _test(config)
         elif config.mode == 'forward':
             _forward(config)
+        elif config.mode == 'retrain':
+            _retrain(config)
         else:
             raise ValueError("invalid value for 'mode': {}".format(config.mode))
 
 
 def set_dirs(config):
     # create directories
-    assert config.load or config.mode == 'train', "config.load must be True if not training"
+    assert config.load or config.mode in ['train', 'retrain'], "config.load must be True if not training"
     if not config.load and os.path.exists(config.out_dir):
         shutil.rmtree(config.out_dir)
 
@@ -123,6 +125,108 @@ def _train(config):
                 graph_handler.dump_eval(e_dev)
             if config.dump_answer:
                 graph_handler.dump_answer(e_dev)
+    if global_step % config.save_period != 0:
+        graph_handler.save(sess, global_step=global_step)
+
+
+def _retrain(config):
+    data_filter = get_squad_data_filter(config)
+    train_data = read_data(config, 'train', True, data_filter=data_filter)
+    dev_data = read_data(config, 'dev', True, data_filter=data_filter)
+    update_config(config, [train_data, dev_data])
+
+    _config_debug(config)
+
+    word2vec_dict = train_data.shared['lower_word2vec'] if config.lower_word else train_data.shared['word2vec']
+    word2idx_dict = train_data.shared['word2idx']
+    idx2vec_dict = {word2idx_dict[word]: vec for word, vec in word2vec_dict.items() if word in word2idx_dict}
+    emb_mat = np.array([idx2vec_dict[idx] if idx in idx2vec_dict
+                        else np.random.multivariate_normal(np.zeros(config.word_emb_size), np.eye(config.word_emb_size))
+                        for idx in range(config.word_vocab_size)])
+    config.emb_mat = emb_mat
+
+    # construct model graph and variables (using default graph)
+    pprint(config.__flags, indent=2)
+    models = get_multi_gpu_models(config)
+    model = models[0]
+    trainer = MultiGPUTrainer(config, models)
+    # evaluator = MultiGPUF1Evaluator(config, models, tensor_dict=model.tensor_dict if config.vis else None)
+    graph_handler = GraphHandler(config,
+                                 model)  # controls all tensors and variables in the graph, including loading /saving
+
+    # Variables
+    print("Init variables start")
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+    graph_handler.initialize(sess)
+    print("Init variables end")
+
+    print("Begin retraining")
+    # Begin training
+    num_steps = config.num_steps or int(
+        math.ceil(train_data.num_examples / (config.batch_size * config.num_gpus))) * config.num_epochs
+    print("config.num_steps: {}".format(config.num_steps))
+    print("not config.num_steps: {}".format(str(int(
+        math.ceil(train_data.num_examples / (config.batch_size * config.num_gpus))) * config.num_epochs)))
+    print("num_steps: {}".format(num_steps))
+    global_step = 0
+    best_val_loss = 100
+    earlystop_num = 0
+    exit_k = 5
+    loss_prev = 100
+    for batches in tqdm(train_data.get_multi_batches(config.batch_size, config.num_gpus,
+                                                     num_steps=num_steps, shuffle=True, cluster=config.cluster),
+                        total=num_steps):
+        global_step = sess.run(model.global_step) + 1  # +1 because all calculations are done after step
+        get_summary = global_step % config.log_period == 0
+        loss, summary, train_op = trainer.step(sess, batches, get_summary=get_summary)
+
+        if global_step % config.print_loss_period == 0:
+            print("loss={} for global_step={}".format(loss, global_step))
+        
+        if get_summary:
+            print("adding summary for global_step={}".format(global_step))
+            graph_handler.add_summary(summary, global_step)
+            print("adding summary for global_step={} end".format(global_step))
+
+        if loss < best_val_loss:
+            best_val_loss = loss
+        if loss >= loss_prev:
+            earlystop_num = earlystop_num + 1
+        else:
+            earlystop_num = 0
+        loss_prev = loss
+        if earlystop_num > exit_k:
+            print("earlystop! saving for global_step={}".format(global_step))
+            graph_handler.save(sess, global_step=global_step)
+            print("earlystop! saving for global_step={} end".format(global_step))
+            print("best_val_loss: {}".format(best_val_loss))
+            break
+
+        # occasional saving
+        if global_step % config.save_period == 0:
+            print("saving for global_step={}".format(global_step))
+            graph_handler.save(sess, global_step=global_step)
+            print("saving for global_step={} end".format(global_step))
+
+        # if not config.eval:
+        #     continue
+        ## Occasional evaluation
+        # if global_step % config.eval_period == 0:
+        #     num_steps = math.ceil(dev_data.num_examples / (config.batch_size * config.num_gpus))
+        #     if 0 < config.val_num_batches < num_steps:
+        #         num_steps = config.val_num_batches
+        #     e_train = evaluator.get_evaluation_from_batches(
+        #         sess, tqdm(train_data.get_multi_batches(config.batch_size, config.num_gpus, num_steps=num_steps), total=num_steps)
+        #     )
+        #     graph_handler.add_summaries(e_train.summaries, global_step)
+        #     e_dev = evaluator.get_evaluation_from_batches(
+        #         sess, tqdm(dev_data.get_multi_batches(config.batch_size, config.num_gpus, num_steps=num_steps), total=num_steps))
+        #     graph_handler.add_summaries(e_dev.summaries, global_step)
+        #
+        #     if config.dump_eval:
+        #         graph_handler.dump_eval(e_dev)
+        #     if config.dump_answer:
+        #         graph_handler.dump_answer(e_dev)
     if global_step % config.save_period != 0:
         graph_handler.save(sess, global_step=global_step)
 
